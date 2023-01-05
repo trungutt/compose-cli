@@ -17,8 +17,10 @@
 package mobycli
 
 import (
+	"bufio"
 	"context"
 	"debug/buildinfo"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -99,11 +101,103 @@ func Exec(root *cobra.Command) {
 	os.Exit(0)
 }
 
+func enhance(prefix, str, id string) string {
+	OSC := "\u001B]"
+	BEL := "\u0007"
+	SEP := ";"
+	deeplink := "docker-desktop://dashboard/" + prefix + "?id=" + id
+	enhanced := []string{OSC, "8", SEP, SEP, deeplink, BEL, str, OSC, "8", SEP, SEP, BEL}
+	return strings.Join(enhanced[:], "")
+}
+
+type Container struct {
+	ShortId string
+	ID      string
+	Names   string
+}
+
+func getContainers() []Container {
+	var cs []Container
+	cmd := exec.Command(comDockerCli(), "ps", "--all", "--no-trunc", "--format", "{\"ID\":\"{{ .ID }}\", \"Names\":\"{{ .Names }}\"}")
+	out, err := cmd.Output()
+	if err != nil {
+		return []Container{}
+	}
+	csStr := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, cStr := range csStr {
+		var c Container
+		err := json.Unmarshal([]byte(cStr), &c)
+		if err != nil {
+			continue
+		}
+		c.ShortId = c.ID[:12]
+		cs = append(cs, c)
+	}
+
+	return cs
+}
+
+type Image struct {
+	ShortId     string
+	ID          string
+	Tag         string
+	Respository string
+}
+
+func getImages() []Image {
+	var imgs []Image
+	cmd := exec.Command(comDockerCli(), "image", "ls", "--no-trunc", "--format", "{\"ID\":\"{{ .ID }}\", \"Tag\":\"{{ .Tag }}\", \"Respository\":\"{{ .Repository }}\"}")
+	out, err := cmd.Output()
+	if err != nil {
+		return []Image{}
+	}
+	imgsStr := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, imgStr := range imgsStr {
+		var img Image
+		err := json.Unmarshal([]byte(imgStr), &img)
+		if err != nil {
+			continue
+		}
+		img.ShortId = strings.TrimPrefix(img.ID, "sha256:")[:12]
+		imgs = append(imgs, img)
+	}
+
+	return imgs
+}
+
+type Volume struct {
+	Name string
+}
+
+func getVolumes() []Volume {
+	var vols []Volume
+	cmd := exec.Command(comDockerCli(), "volume", "ls", "--format", "{\"Name\":\"{{ .Name }}\"}")
+	out, err := cmd.Output()
+	if err != nil {
+		return []Volume{}
+	}
+	volsStr := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, volStr := range volsStr {
+		var vol Volume
+		err := json.Unmarshal([]byte(volStr), &vol)
+		if err != nil {
+			continue
+		}
+		vols = append(vols, vol)
+	}
+
+	return vols
+}
+
 // RunDocker runs a docker command, and forward signals to the shellout command (stops listening to signals when an event is sent to childExit)
 func RunDocker(childExit chan bool, args ...string) error {
 	cmd := exec.Command(comDockerCli(), args...)
+	cons := getContainers()
+	vols := getVolumes()
+	imgs := getImages()
+	
 	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
+	// cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	signals := make(chan os.Signal, 1)
@@ -128,7 +222,62 @@ func RunDocker(childExit chan bool, args ...string) error {
 		}
 	}()
 
-	return cmd.Run()
+	r, w, _ := os.Pipe()
+	cmd.Stdout = w
+
+	done := make(chan struct{})
+	// copy the output in a separate goroutine so printing can't block indefinitely
+	go func() {
+		scanner := bufio.NewScanner(r)
+		for scanner.Scan() {
+			if args[0] == "run" {
+				cons = getContainers()
+				vols = getVolumes()
+				imgs = getImages()
+			}
+
+			line := scanner.Text()
+			for _, c := range cons {
+				cRegex := regexp.MustCompile("(" + c.ShortId + "[a-z0-9]*" + ")")
+				line = cRegex.ReplaceAllString(line, enhance("containers", "$1", c.ID))
+
+				cRegex = regexp.MustCompile("(" + c.Names + ")")
+				line = cRegex.ReplaceAllString(line, enhance("containers", "$1", c.ID))
+			}
+
+			for _, v := range vols {
+				cRegex := regexp.MustCompile("(" + v.Name + ")")
+				line = cRegex.ReplaceAllString(line, enhance("volumes", "$1", v.Name))
+			}
+
+			for _, img := range imgs {
+				if strings.Contains(line, img.Respository) {
+					cRegex := regexp.MustCompile("(" + img.Respository + ")")
+					if strings.Contains(line, img.Tag) {
+						line = cRegex.ReplaceAllString(line, enhance("images", "$1", img.ID+"-"+img.Tag))
+					} else {
+						line = cRegex.ReplaceAllString(line, enhance("images", "$1", img.ID+"-latest"))
+					}
+				}
+
+				// cRegex := regexp.MustCompile("(" + img.ShortId + "[a-z0-9]*" + ")")
+				// line = cRegex.ReplaceAllString(line, enhance("images", "$1", img.ID+"-"+img.Tag))
+			}
+
+			fmt.Fprintln(os.Stdout, line)
+		}
+		done <- struct{}{}
+	}()
+
+	// execute the command
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	w.Close()
+	<-done
+
+	return nil
 }
 
 func comDockerCli() string {
